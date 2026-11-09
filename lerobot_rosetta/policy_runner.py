@@ -27,13 +27,14 @@ stays framework-agnostic.
 
 from __future__ import annotations
 
+import json
 import os
 import socket
 import subprocess
 import sys
-import tempfile
 import threading
 import time
+from collections import deque
 from collections.abc import Callable
 from dataclasses import fields
 from typing import Optional
@@ -48,6 +49,7 @@ from rcl_interfaces.msg import ParameterDescriptor
 from lerobot_robot_rosetta.config_rosetta import RosettaConfig
 from lerobot_robot_rosetta.rosetta import GATE_SLICE_SEC
 from rosetta.contract.schema import Contract
+from rosetta.contract.sidecar import resolve_repo_file
 from rosetta.frames.protocols import FrameIO
 from rosetta.policies import RunnerFeedback, RunnerResult
 
@@ -55,6 +57,7 @@ SERVER_STARTUP_TIMEOUT_SEC = 120.0  # default; covers model preload (see param)
 SERVER_STARTUP_POLL_SEC = 0.5
 SERVER_STOP_TIMEOUT_SEC = 5.0
 THREAD_JOIN_TIMEOUT_SEC = 2.0
+SERVER_LOG_TAIL_LINES = 50  # server output lines kept for error messages
 
 
 def _resolve_policy_device(
@@ -78,6 +81,26 @@ def _resolve_policy_device(
     return device if available else "cpu"
 
 
+def _read_checkpoint_policy_type(
+    pretrained_name_or_path: str,
+    warn: Callable[[str], None],
+) -> str | None:
+    """Return the "type" field of the checkpoint's config.json, or None.
+
+    The checkpoint is a local directory or a Hub model id (resolve_repo_file
+    handles both and reports Hub failures through warn).
+    """
+    config_path = resolve_repo_file(pretrained_name_or_path, "config.json", repo_type="model", warn=warn)
+    if config_path is None:
+        return None
+    try:
+        policy_type = json.loads(config_path.read_text()).get("type")
+    except (OSError, ValueError, AttributeError) as e:
+        warn(f"Could not read policy type from {config_path}: {e}")
+        return None
+    return policy_type if isinstance(policy_type, str) and policy_type else None
+
+
 class LeRobotPolicyRunner:
     """PolicyRunner backed by LeRobot's RobotClient."""
 
@@ -87,9 +110,10 @@ class LeRobotPolicyRunner:
         self._contract_path: str = ""
         self._client: Optional[RobotClient] = None
         self._policy_device: str = "cpu"
+        self._policy_type: str = ""
         self._server_process: Optional[subprocess.Popen] = None
-        self._server_log = None  # file handle for the server subprocess output
-        self._server_log_path: str = ""
+        self._server_log_thread: Optional[threading.Thread] = None
+        self._server_log_tail: deque[str] = deque(maxlen=SERVER_LOG_TAIL_LINES)
 
     # -------------------- Lifecycle --------------------
 
@@ -120,9 +144,14 @@ class LeRobotPolicyRunner:
 
         _p("pretrained_name_or_path", "", "Path or HF repo ID of trained policy", True)
         _p("server_address", "127.0.0.1:8080", "Policy server address (host:port)", True)
-        _p("policy_type", "act", "Policy architecture (act, diffusion, ...)", True)
+        _p(
+            "policy_type",
+            "",
+            "Policy architecture override (act, diffusion, ...). Empty = read 'type' from the checkpoint's config.json",
+            True,
+        )
         _p("policy_device", "cuda", "Device for policy inference (cuda, xpu, mps, cpu; cpu fallback)", True)
-        _p("actions_per_chunk", 50, "Number of actions to request per chunk")
+        _p("actions_per_chunk", 10, "Number of actions to request per chunk")
         _p("chunk_size_threshold", 0.5, "Queue threshold ratio to request new chunk (0.0-1.0)")
         _p("aggregate_fn_name", "weighted_average", "Action aggregation function")
         _p("launch_local_server", True, "Launch local policy server subprocess", True)
@@ -145,6 +174,8 @@ class LeRobotPolicyRunner:
                 f"Requested policy device '{requested_device}' but the requested backend "
                 f"is unavailable; using '{self._policy_device}' instead."
             )
+
+        self._policy_type = self._resolve_policy_type()
 
         # Warm start: pay subprocess spawn + torch/CUDA init + model preload at
         # configure time so the first goal costs the same as any other. A
@@ -170,6 +201,9 @@ class LeRobotPolicyRunner:
         # (with the same preload args — params are read-only) if it died.
         if self._node.get_parameter("launch_local_server").value:
             self._start_policy_server()
+
+        if not self._policy_type:
+            return RunnerResult(False, "No policy type: set pretrained_name_or_path (or policy_type)")
 
         robot_config = RosettaConfig(
             id="rosetta",
@@ -252,6 +286,34 @@ class LeRobotPolicyRunner:
                 client.shutdown_event.set()
                 return
 
+    def _resolve_policy_type(self) -> str:
+        """Policy type from the checkpoint's config.json; the parameter overrides it.
+
+        Raises when a checkpoint is set but its type can't be determined, so
+        the lifecycle configure fails instead of the first goal.
+        """
+        node = self._node
+        logger = node.get_logger()
+        requested = node.get_parameter("policy_type").value.strip()
+        pretrained = node.get_parameter("pretrained_name_or_path").value
+        if not pretrained:
+            return requested
+
+        detected = _read_checkpoint_policy_type(pretrained, logger.warning)
+        if requested:
+            if detected and detected != requested:
+                logger.warning(
+                    f"policy_type '{requested}' overrides checkpoint config.json type '{detected}' ({pretrained})"
+                )
+            return requested
+        if detected is None:
+            raise RuntimeError(
+                f"Could not determine the policy type from {pretrained}/config.json; "
+                "set the policy_type parameter explicitly"
+            )
+        logger.info(f"Policy type '{detected}' read from checkpoint config.json ({pretrained})")
+        return detected
+
     def _build_client_config(self, robot_config: RosettaConfig, task: str) -> RobotClientConfig:
         """Build RobotClientConfig from ROS2 parameters.
 
@@ -276,7 +338,7 @@ class LeRobotPolicyRunner:
         config_kwargs = {
             "robot": robot_config,
             "server_address": node.get_parameter("server_address").value,
-            "policy_type": node.get_parameter("policy_type").value,
+            "policy_type": self._policy_type,
             "pretrained_name_or_path": node.get_parameter("pretrained_name_or_path").value,
             "policy_device": self._policy_device,
             "task": task,
@@ -315,7 +377,7 @@ class LeRobotPolicyRunner:
         pretrained = node.get_parameter("pretrained_name_or_path").value
         if pretrained:
             cmd += [
-                f"--policy-type={node.get_parameter('policy_type').value}",
+                f"--policy-type={self._policy_type}",
                 f"--pretrained-name-or-path={pretrained}",
                 f"--policy-device={self._policy_device}",
             ]
@@ -326,16 +388,20 @@ class LeRobotPolicyRunner:
             )
         timeout = node.get_parameter("server_startup_timeout_sec").value
 
-        # Capture stdout+stderr to a log file so startup failures are visible
-        # (a pipe could deadlock if nobody drains it while the server runs).
-        log = tempfile.NamedTemporaryFile(prefix="rosetta_policy_server_", suffix=".log", delete=False)
-        self._server_log = log
-        self._server_log_path = log.name
         node.get_logger().info(
-            f"Launching {module} on {host}:{port} "
-            f"(preload={pretrained or 'none'}, timeout={timeout}s, log: {log.name})..."
+            f"Launching {module} on {host}:{port} (preload={pretrained or 'none'}, timeout={timeout}s)..."
         )
-        self._server_process = subprocess.Popen(cmd, env=os.environ.copy(), stdout=log, stderr=subprocess.STDOUT)
+        # Pipe stdout+stderr through a reader thread that echoes to the console
+        # and keeps a tail for error messages (it also drains the pipe so the
+        # server can never block on a full buffer).
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+        self._server_log_tail.clear()
+        self._server_process = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        self._server_log_thread = threading.Thread(
+            target=self._pump_server_output, args=(self._server_process.stdout,), daemon=True
+        )
+        self._server_log_thread.start()
 
         start_time = time.time()
         while time.time() - start_time < timeout:
@@ -353,21 +419,28 @@ class LeRobotPolicyRunner:
 
         raise RuntimeError(f"Policy server failed to start within {timeout}s. Last output:\n{self._read_log_tail()}")
 
-    def _read_log_tail(self, max_bytes: int = 4000) -> str:
-        """Tail of the server log, for diagnostics."""
-        try:
-            with open(self._server_log_path, "rb") as f:
-                f.seek(0, os.SEEK_END)
-                f.seek(max(0, f.tell() - max_bytes))
-                return f.read().decode("utf-8", "replace")
-        except OSError:
-            return "(no server log available)"
+    def _pump_server_output(self, stream) -> None:
+        """Echo server output to the console and remember the last lines."""
+        for raw in iter(stream.readline, b""):
+            line = raw.decode("utf-8", "replace")
+            self._server_log_tail.append(line)
+            sys.stdout.write(f"[policy_server] {line}")
+            sys.stdout.flush()
+        stream.close()
+
+    def _read_log_tail(self) -> str:
+        """Last lines of server output, for diagnostics."""
+        proc = self._server_process
+        if self._server_log_thread is not None and proc is not None and proc.poll() is not None:
+            # Let the reader catch up with output written just before exit.
+            self._server_log_thread.join(timeout=THREAD_JOIN_TIMEOUT_SEC)
+        return "".join(self._server_log_tail) or "(no server output)"
 
     def _stop_policy_server(self) -> None:
         """Terminate the policy server process if running."""
         proc = self._server_process
         if proc is None or proc.poll() is not None:
-            self._close_server_log()
+            self._join_server_log_thread()
             self._server_process = None
             return
         if self._node is not None:
@@ -382,13 +455,10 @@ class LeRobotPolicyRunner:
             except subprocess.TimeoutExpired:
                 if self._node is not None:
                     self._node.get_logger().error("Policy server did not exit after kill().")
-        self._close_server_log()
+        self._join_server_log_thread()
         self._server_process = None
 
-    def _close_server_log(self) -> None:
-        if self._server_log is not None:
-            try:
-                self._server_log.close()
-            except OSError:
-                pass
-            self._server_log = None
+    def _join_server_log_thread(self) -> None:
+        if self._server_log_thread is not None:
+            self._server_log_thread.join(timeout=THREAD_JOIN_TIMEOUT_SEC)
+            self._server_log_thread = None

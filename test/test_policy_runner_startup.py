@@ -20,8 +20,11 @@ goal. No real subprocesses or sockets: Popen and create_connection are
 monkeypatched.
 """
 
+import io
+import json
 import threading
 from contextlib import nullcontext
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -67,6 +70,7 @@ class _FakeNode:
 class _FakeProc:
     def __init__(self, argv):
         self.argv = argv
+        self.stdout = io.BytesIO()  # drained by the runner's log pump
         self.returncode = None
         self.poll_value = None
 
@@ -74,9 +78,27 @@ class _FakeProc:
         return self.poll_value
 
 
+def _checkpoint(tmp_path, policy_type="act"):
+    """Local checkpoint dir whose config.json declares policy_type."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "config.json").write_text(json.dumps({"type": policy_type}))
+    return tmp_path
+
+
 @pytest.fixture
-def spawned(monkeypatch):
-    """Neutralize contract validation, subprocess, and socket; record spawns."""
+def spawned(monkeypatch, tmp_path):
+    """Neutralize contract validation, subprocess, and socket; record spawns.
+
+    Any checkpoint not given as a real directory resolves to an "act"
+    config.json, so the "user/repo" ids never reach the Hub.
+    """
+    act_config = _checkpoint(tmp_path / "hub_act") / "config.json"
+    real_resolve = pr.resolve_repo_file
+    monkeypatch.setattr(
+        pr,
+        "resolve_repo_file",
+        lambda path, filename, **kw: real_resolve(path, filename, **kw) if Path(path).is_dir() else act_config,
+    )
     import lerobot_robot_rosetta.rosetta as adapter
     import rosetta.contract.specs as cu
 
@@ -223,3 +245,32 @@ def test_run_injects_bridge_and_stop_event(spawned, monkeypatch):
     robot_config = captured["config"].robot
     assert robot_config._external_bridge is frames
     assert robot_config._stop_event is stop
+
+
+def test_policy_type_read_from_checkpoint_config(spawned, tmp_path):
+    ckpt = _checkpoint(tmp_path / "ckpt", "target_reach")
+    runner, node = _setup_runner({"pretrained_name_or_path": str(ckpt), "policy_device": "cpu"})
+    assert f"--policy-type=target_reach" in spawned[0].argv
+    assert runner._build_client_config(SimpleNamespace(fps=30), task="t").policy_type == "target_reach"
+    assert any("target_reach" in m and "config.json" in m for m in node.get_logger().infos)
+
+
+def test_policy_type_param_overrides_checkpoint(spawned, tmp_path):
+    ckpt = _checkpoint(tmp_path / "ckpt", "target_reach")
+    _runner, node = _setup_runner({"pretrained_name_or_path": str(ckpt), "policy_type": "act"})
+    assert "--policy-type=act" in spawned[0].argv
+    assert any("overrides checkpoint" in w for w in node.get_logger().warnings)
+
+
+def test_unreadable_checkpoint_type_fails_setup(spawned, tmp_path):
+    ckpt = tmp_path / "no_config"
+    ckpt.mkdir()
+    with pytest.raises(RuntimeError, match="Could not determine the policy type"):
+        _setup_runner({"pretrained_name_or_path": str(ckpt)})
+    assert spawned == []
+
+
+def test_run_without_policy_type_fails_cleanly(spawned):
+    runner, _node = _setup_runner()  # no checkpoint, no override
+    result = runner.run(object(), task="t", stop_event=threading.Event())
+    assert not result.success

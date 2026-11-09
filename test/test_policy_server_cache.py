@@ -24,6 +24,7 @@ import pickle
 from types import SimpleNamespace
 
 import pytest
+import torch
 from lerobot.async_inference.configs import PolicyServerConfig
 from lerobot.async_inference.helpers import RemotePolicyConfig
 
@@ -137,3 +138,42 @@ def test_unsupported_policy_type_rejected(recorder, server):
     with pytest.raises(ValueError, match="not supported"):
         server.preload("not_a_policy", "user/repo", "cpu")
     assert recorder.loads == []
+
+
+def _client_steps(server, chunk_len, rounds):
+    """Drive RobotClient's real queue logic against the server's chunk timing.
+
+    Each round: stamp an observation like control_loop_observation, time a
+    chunk on the server, aggregate it into the client queue, then perform every
+    queued action. Returns the performed timesteps.
+    """
+    import threading
+    from queue import Queue
+
+    from lerobot.async_inference.robot_client import RobotClient
+
+    client = SimpleNamespace(
+        action_queue=Queue(),
+        action_queue_lock=threading.Lock(),
+        latest_action=-1,
+        latest_action_lock=threading.Lock(),
+    )
+    performed = []
+    for _ in range(rounds):
+        obs_timestep = max(client.latest_action, 0)
+        chunk = server._time_action_chunk(0.0, [torch.zeros(1)] * chunk_len, obs_timestep)
+        RobotClient._aggregate_action_queues(client, chunk)
+        while not client.action_queue.empty():
+            client.latest_action = client.action_queue.get_nowait().get_timestep()
+            performed.append(client.latest_action)
+    return performed
+
+
+def test_single_action_chunks_keep_executing(server):
+    # Upstream timing labels chunk[0] with the obs timestep, which the client
+    # already performed, so every chunk after the first was dropped.
+    assert _client_steps(server, chunk_len=1, rounds=5) == [1, 2, 3, 4, 5]
+
+
+def test_multi_action_chunks_execute_every_action(server):
+    assert _client_steps(server, chunk_len=3, rounds=2) == [1, 2, 3, 4, 5, 6]

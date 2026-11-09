@@ -39,6 +39,7 @@ import time
 from concurrent import futures
 
 import grpc
+import torch
 from lerobot.async_inference.configs import PolicyServerConfig
 from lerobot.async_inference.constants import (
     DEFAULT_FPS,
@@ -46,13 +47,19 @@ from lerobot.async_inference.constants import (
     DEFAULT_OBS_QUEUE_TIMEOUT,
     SUPPORTED_POLICIES,
 )
-from lerobot.async_inference.helpers import RemotePolicyConfig
+from lerobot.async_inference.helpers import RemotePolicyConfig, TimedAction
 from lerobot.async_inference.policy_server import PolicyServer
 from lerobot.policies import get_policy_class, make_pre_post_processors
 from lerobot.transport import (
     services_pb2,  # type: ignore
     services_pb2_grpc,  # type: ignore
 )
+from lerobot.utils.import_utils import register_third_party_plugins
+
+# Plugin-provided policies (registered by register_third_party_plugins()) that
+# are not in LeRobot's built-in SUPPORTED_POLICIES.
+PLUGIN_POLICIES = ("target_reach",)
+ALLOWED_POLICIES = (*SUPPORTED_POLICIES, *PLUGIN_POLICIES)
 
 
 class RosettaPolicyServer(PolicyServer):
@@ -69,8 +76,8 @@ class RosettaPolicyServer(PolicyServer):
 
     def _ensure_policy(self, policy_type: str, pretrained_name_or_path: str, device: str) -> bool:
         """Load the policy iff it differs from what is loaded. Returns True on load."""
-        if policy_type not in SUPPORTED_POLICIES:
-            raise ValueError(f"Policy type {policy_type} not supported. Supported policies: {SUPPORTED_POLICIES}")
+        if policy_type not in ALLOWED_POLICIES:
+            raise ValueError(f"Policy type {policy_type} not supported. Supported policies: {ALLOWED_POLICIES}")
 
         key = (policy_type, pretrained_name_or_path, device)
         if self._loaded_key == key:
@@ -93,6 +100,20 @@ class RosettaPolicyServer(PolicyServer):
             f"(type={policy_type}, path={pretrained_name_or_path})"
         )
         return True
+
+    def _time_action_chunk(self, t_0: float, action_chunk: list[torch.Tensor], i_0: int) -> list[TimedAction]:
+        """Label chunk[0] with the step after the observation's.
+
+        RobotClient stamps an observation with the timestep of the action it
+        already performed (max(latest_action, 0)) and drops incoming actions
+        with timestep <= latest_action. Upstream labels chunk[0] with i_0, so
+        the first action of every chunk is always discarded as stale; with a
+        single-action chunk nothing after the very first chunk ever executes.
+        """
+        return [
+            TimedAction(timestamp=t_0 + (i + 1) * self.config.environment_dt, timestep=i_0 + i + 1, action=action)
+            for i, action in enumerate(action_chunk)
+        ]
 
     # Mirrors lerobot.async_inference.policy_server.PolicyServer.
     # SendPolicyInstructions (lerobot v0.6.0 pin, see repos/libs.repos) with the
@@ -163,6 +184,10 @@ def main():
     parser.add_argument("--pretrained-name-or-path", default="", help="Preload: weights path/repo")
     parser.add_argument("--policy-device", default="", help="Preload: inference device")
     args = parser.parse_args()
+
+    # Import installed lerobot_policy_* plugins (e.g. target_reach) so their
+    # policy classes are registered before any preload or handshake.
+    register_third_party_plugins()
 
     config = PolicyServerConfig(
         host=args.host,
